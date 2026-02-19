@@ -4,6 +4,10 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.net.ServerSocket;
 import java.net.Socket;
 import javax.crypto.SecretKey;
@@ -58,6 +62,9 @@ public class SecureServer {
     static class ClientHandler implements Runnable {
         private Socket socket;
         private SecretKey key;
+
+        private static final boolean IS_WINDOWS =
+            System.getProperty("os.name").toLowerCase().contains("win");
         
         public ClientHandler(Socket socket, SecretKey key) {
             this.socket = socket;
@@ -70,6 +77,10 @@ public class SecureServer {
                 BufferedReader in = new BufferedReader(
                     new InputStreamReader(socket.getInputStream()));
                 PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+
+                // Per-connection working directory. Commands like `cd` must update this
+                // state; spawning a new shell per command cannot persist directory changes.
+                Path currentDirectory = Paths.get(System.getProperty("user.dir")).toAbsolutePath().normalize();
                 
                 // Send encryption key to client (Base64 encoded)
                 String keyString = SecurityUtils.keyToString(key);
@@ -131,10 +142,11 @@ public class SecureServer {
                         System.out.println("Received command: " + command);
                         
                         // Execute command using ProcessBuilder
-                        String result = executeCommand(command);
+                        ExecResult result = executeCommand(command, currentDirectory);
+                        currentDirectory = result.currentDirectory;
                         
                         // Encrypt and send response
-                        String encryptedResult = SecurityUtils.encrypt(result, key);
+                        String encryptedResult = SecurityUtils.encrypt(result.output, key);
                         out.println(encryptedResult);
                         
                     } catch (Exception e) {
@@ -167,41 +179,152 @@ public class SecureServer {
          * @param command The command string to execute
          * @return The output of the command execution
          */
-        private String executeCommand(String command) {
+        private static class ExecResult {
+            private final String output;
+            private final Path currentDirectory;
+
+            private ExecResult(String output, Path currentDirectory) {
+                this.output = output;
+                this.currentDirectory = currentDirectory;
+            }
+        }
+
+        private ExecResult executeCommand(String command, Path currentDirectory) {
+            String sanitized = command == null ? "" : command.trim();
+            if (sanitized.isEmpty()) {
+                return new ExecResult("Exit Code: 0", currentDirectory);
+            }
+
+            // Provide a convenient way to view the current directory.
+            if (sanitized.equalsIgnoreCase("pwd") || sanitized.equalsIgnoreCase("cd")) {
+                return new ExecResult(currentDirectory.toString() + "\nExit Code: 0", currentDirectory);
+            }
+
+            // Special-case `cd` because it's a shell built-in and would not persist when each
+            // command is executed in a new shell. We update the per-connection working directory.
+            if (startsWithCd(sanitized)) {
+                CdParse cdParse = parseCd(sanitized);
+                ExecResult cdResult = handleCd(cdParse.cdArg, currentDirectory);
+                if (cdParse.remainder == null || cdParse.remainder.isBlank()) {
+                    return cdResult;
+                }
+                // If the user typed something like `cd .. && dir`, run the remainder in the new directory.
+                ExecResult remainderResult = executeShellCommand(cdParse.remainder, cdResult.currentDirectory);
+                return new ExecResult(cdResult.output + "\n" + remainderResult.output, remainderResult.currentDirectory);
+            }
+
+            return executeShellCommand(sanitized, currentDirectory);
+        }
+
+        private boolean startsWithCd(String command) {
+            // `cd..` is valid in cmd.exe, so allow that as well.
+            String lower = command.toLowerCase();
+            return lower.equals("cd") || lower.startsWith("cd ") || lower.startsWith("cd..") || lower.startsWith("cd\\") || lower.startsWith("cd/");
+        }
+
+        private static class CdParse {
+            private final String cdArg;
+            private final String remainder;
+
+            private CdParse(String cdArg, String remainder) {
+                this.cdArg = cdArg;
+                this.remainder = remainder;
+            }
+        }
+
+        private CdParse parseCd(String command) {
+            // Split on common chaining operators, keeping only the first one.
+            int andIdx = command.indexOf("&&");
+            int semiIdx = command.indexOf(';');
+            int splitIdx = -1;
+            if (andIdx >= 0 && semiIdx >= 0) {
+                splitIdx = Math.min(andIdx, semiIdx);
+            } else if (andIdx >= 0) {
+                splitIdx = andIdx;
+            } else if (semiIdx >= 0) {
+                splitIdx = semiIdx;
+            }
+
+            String cdPart = splitIdx >= 0 ? command.substring(0, splitIdx).trim() : command.trim();
+            String remainder = splitIdx >= 0 ? command.substring(splitIdx + (splitIdx == andIdx ? 2 : 1)).trim() : null;
+
+            String cdArg = "";
+            String lowered = cdPart.toLowerCase();
+            if (lowered.equals("cd")) {
+                cdArg = "";
+            } else if (lowered.startsWith("cd..")) {
+                cdArg = "..";
+            } else if (lowered.startsWith("cd")) {
+                cdArg = cdPart.substring(2).trim();
+            }
+
+            return new CdParse(cdArg, remainder);
+        }
+
+        private ExecResult handleCd(String arg, Path currentDirectory) {
+            String rawArg = arg == null ? "" : arg.trim();
+            Path target;
+
+            if (rawArg.isEmpty()) {
+                target = Paths.get(System.getProperty("user.home"));
+            } else {
+                // Common shorthand
+                if (rawArg.equals("~")) {
+                    rawArg = System.getProperty("user.home");
+                } else if (rawArg.startsWith("~\\") || rawArg.startsWith("~/")) {
+                    rawArg = System.getProperty("user.home") + rawArg.substring(1);
+                }
+
+                try {
+                    Path inputPath = Paths.get(rawArg);
+                    target = inputPath.isAbsolute() ? inputPath : currentDirectory.resolve(inputPath);
+                } catch (InvalidPathException e) {
+                    return new ExecResult("Invalid path: " + e.getMessage() + "\nExit Code: 1", currentDirectory);
+                }
+            }
+
+            target = target.toAbsolutePath().normalize();
+
+            if (!Files.exists(target)) {
+                return new ExecResult("The system cannot find the path specified: " + target + "\nExit Code: 1", currentDirectory);
+            }
+            if (!Files.isDirectory(target)) {
+                return new ExecResult("Not a directory: " + target + "\nExit Code: 1", currentDirectory);
+            }
+
+            return new ExecResult("Changed directory to: " + target + "\nExit Code: 0", target);
+        }
+
+        private ExecResult executeShellCommand(String command, Path currentDirectory) {
             StringBuilder output = new StringBuilder();
-            
+
             try {
                 ProcessBuilder processBuilder;
-                
-                // Check if running on Windows to handle shell built-ins like 'dir'
-                if (System.getProperty("os.name").toLowerCase().contains("win")) {
-                    // Windows: use cmd /c to handle built-in commands
+
+                if (IS_WINDOWS) {
                     processBuilder = new ProcessBuilder("cmd", "/c", command);
                 } else {
-                    // Linux/Mac: use sh -c to handle built-in commands like 'ls'
                     processBuilder = new ProcessBuilder("sh", "-c", command);
                 }
-                
+
+                processBuilder.directory(currentDirectory.toFile());
                 processBuilder.redirectErrorStream(true);
                 Process process = processBuilder.start();
-                
-                // Read command output
-                BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(process.getInputStream()));
-                
+
+                BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
                 String line;
                 while ((line = reader.readLine()) != null) {
                     output.append(line).append("\n");
                 }
-                
+
                 int exitCode = process.waitFor();
                 output.append("Exit Code: ").append(exitCode);
-                
+
             } catch (Exception e) {
                 output.append("Command execution failed: ").append(e.getMessage());
             }
-            
-            return output.toString();
+
+            return new ExecResult(output.toString(), currentDirectory);
         }
     }
 }

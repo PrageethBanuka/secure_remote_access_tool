@@ -1,2 +1,0 @@
-Hello this is a test message 
-This is a second line 
