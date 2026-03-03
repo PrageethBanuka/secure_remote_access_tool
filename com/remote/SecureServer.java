@@ -12,6 +12,8 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.security.KeyPair;
 import java.security.PrivateKey;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import javax.crypto.SecretKey;
 
 /**
@@ -23,6 +25,15 @@ public class SecureServer {
     
     static int port = 6600;
     private static KeyPair rsaKeyPair;
+    
+    // Brute-force protection: tracks failed login attempts per IP address.
+    // After MAX_FAILED_ATTEMPTS failures, the IP is locked out for LOCKOUT_DURATION_MS.
+    private static final int MAX_FAILED_ATTEMPTS = 3;
+    private static final long LOCKOUT_DURATION_MS = 30_000; // 30 seconds
+    private static final Map<String, int[]> failedAttempts = new ConcurrentHashMap<>();
+    // failedAttempts value: int[]{attemptCount, lastFailTimestamp(high), lastFailTimestamp(low)}
+    // Using long split into two ints to stay in int[] — or we can use a simple inner class.
+    private static final Map<String, Long> lockoutTimestamps = new ConcurrentHashMap<>();
     
     // Hardcoded authentication credentials
     // Password is stored as a PBKDF2-HMAC-SHA256 hash with a random salt.
@@ -91,6 +102,19 @@ public class SecureServer {
                 // state; spawning a new shell per command cannot persist directory changes.
                 Path currentDirectory = Paths.get(System.getProperty("user.dir")).toAbsolutePath().normalize();
                 
+                // === Brute-force Protection ===
+                String clientIP = socket.getInetAddress().getHostAddress();
+                Long lockoutUntil = lockoutTimestamps.get(clientIP);
+                if (lockoutUntil != null && System.currentTimeMillis() < lockoutUntil) {
+                    long remainingSec = (lockoutUntil - System.currentTimeMillis()) / 1000;
+                    System.out.println("Blocked connection from locked-out IP: " + clientIP 
+                        + " (" + remainingSec + "s remaining)");
+                    // Send a plaintext rejection before key exchange (no encryption established yet)
+                    out.println("LOCKED_OUT");
+                    socket.close();
+                    return;
+                }
+
 
                 // === RSA-OAEP Key Exchange ===
                 SecretKey key;
@@ -134,13 +158,30 @@ public class SecureServer {
                     
                     // Verify credentials using PBKDF2 hash comparison
                     if (!ADMIN_USER.equals(username) || !SecurityUtils.verifyPassword(password, ADMIN_PASS_HASH, ADMIN_SALT)) {
-                        System.out.println("Authentication failed for user: " + username);
+                        System.out.println("Authentication failed for user: " + username + " from " + clientIP);
+                        
+                        // Track failed attempt for brute-force protection
+                        int attempts = failedAttempts.merge(clientIP, new int[]{1}, (old, v) -> {
+                            old[0]++;
+                            return old;
+                        })[0];
+                        
+                        if (attempts >= MAX_FAILED_ATTEMPTS) {
+                            lockoutTimestamps.put(clientIP, System.currentTimeMillis() + LOCKOUT_DURATION_MS);
+                            System.out.println("IP " + clientIP + " locked out for " 
+                                + (LOCKOUT_DURATION_MS / 1000) + " seconds after " + attempts + " failed attempts.");
+                            failedAttempts.remove(clientIP);
+                        }
+                        
                         String unauthorizedMsg = SecurityUtils.encrypt("Unauthorized", key);
                         out.println(unauthorizedMsg);
                         socket.close();
                         return;
                     }
                     
+                    // Reset failed attempts on successful login
+                    failedAttempts.remove(clientIP);
+                    lockoutTimestamps.remove(clientIP);
                     System.out.println("User authenticated: " + username);
                     
                     // Send authentication success message

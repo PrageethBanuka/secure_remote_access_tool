@@ -37,8 +37,18 @@ public class SecureClient {
                 Scanner scannerInput = new Scanner(System.in);
                 
                 // === RSA-OAEP Key Exchange ===
-                // Step 1: Receive server's RSA public key
+                // Step 1: Receive server's RSA public key (or lockout message)
                 String publicKeyString = in.readLine();
+                
+                // Check if the server has locked us out due to too many failed attempts
+                if ("LOCKED_OUT".equals(publicKeyString)) {
+                    System.out.println("\nAccess denied: Too many failed login attempts.");
+                    System.out.println("Please try again later (30 second cooldown).");
+                    scannerInput.close();
+                    socket.close();
+                    return;
+                }
+                
                 PublicKey serverPublicKey = SecurityUtils.stringToPublicKey(publicKeyString);
                 System.out.println("Server's RSA public key received.");
                 
