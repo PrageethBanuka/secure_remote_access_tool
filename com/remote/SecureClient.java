@@ -6,6 +6,7 @@ import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.net.InetAddress;
 import java.net.Socket;
+import java.security.PublicKey;
 import java.util.Scanner;
 import javax.crypto.SecretKey;
 
@@ -35,10 +36,20 @@ public class SecureClient {
                 PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
                 Scanner scannerInput = new Scanner(System.in);
                 
-                // Receive encryption key from server
-                String keyString = in.readLine();
-                SecretKey secretKey = SecurityUtils.stringToKey(keyString);
-                System.out.println("Encryption key received from server.");
+                // === RSA-OAEP Key Exchange ===
+                // Step 1: Receive server's RSA public key
+                String publicKeyString = in.readLine();
+                PublicKey serverPublicKey = SecurityUtils.stringToPublicKey(publicKeyString);
+                System.out.println("Server's RSA public key received.");
+                
+                // Step 2: Generate a fresh AES-256 session key (unique to this connection)
+                SecretKey secretKey = SecurityUtils.generateKey();
+                
+                // Step 3: Encrypt the AES key with server's RSA public key (OAEP) and send
+                String aesKeyString = SecurityUtils.keyToString(secretKey);
+                String encryptedAesKey = SecurityUtils.encryptWithRSA(aesKeyString, serverPublicKey);
+                out.println(encryptedAesKey);
+                System.out.println("AES-256 session key sent securely via RSA-OAEP.");
                 System.out.println();
                 
                 // Authentication handshake
