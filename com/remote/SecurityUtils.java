@@ -5,8 +5,14 @@ import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
+import java.security.KeyFactory;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
 import java.security.NoSuchAlgorithmException;
+import java.security.PrivateKey;
+import java.security.PublicKey;
 import java.security.SecureRandom;
+import java.security.spec.X509EncodedKeySpec;
 import java.util.Base64;
 
 /**
@@ -19,6 +25,12 @@ public class SecurityUtils {
     private static final String TRANSFORMATION = "AES/GCM/NoPadding";
     private static final int GCM_IV_LENGTH = 12;      // 96-bit IV (NIST recommended)
     private static final int GCM_TAG_LENGTH = 128;     // 128-bit authentication tag
+    
+    // RSA-OAEP: uses SHA-256 for hashing and MGF1 for mask generation.
+    // OAEP avoids Bleichenbacher's chosen-ciphertext attack against PKCS#1 v1.5.
+    private static final String RSA_ALGORITHM = "RSA";
+    private static final String RSA_TRANSFORMATION = "RSA/ECB/OAEPWithSHA-256AndMGF1Padding";
+    private static final int RSA_KEY_SIZE = 2048;
     
     /**
      * Generates a new AES SecretKey for encryption and decryption.
@@ -111,6 +123,83 @@ public class SecurityUtils {
     public static SecretKey stringToKey(String keyString) {
         byte[] decodedKey = Base64.getDecoder().decode(keyString);
         return new SecretKeySpec(decodedKey, 0, decodedKey.length, ALGORITHM);
+    }
+    
+    // ======================== RSA-OAEP Methods ========================
+    
+    /**
+     * Generates an RSA 2048-bit key pair for asymmetric encryption.
+     * The public key is sent to the client; the private key stays on the server.
+     * 
+     * @return A KeyPair containing the RSA public and private keys
+     * @throws NoSuchAlgorithmException if RSA algorithm is not available
+     */
+    public static KeyPair generateRSAKeyPair() throws NoSuchAlgorithmException {
+        KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance(RSA_ALGORITHM);
+        keyPairGenerator.initialize(RSA_KEY_SIZE, new SecureRandom());
+        return keyPairGenerator.generateKeyPair();
+    }
+    
+    /**
+     * Converts an RSA PublicKey to a Base64 encoded string for network transmission.
+     * Uses X.509 encoding format (standard for public keys).
+     * 
+     * @param publicKey The RSA PublicKey to encode
+     * @return Base64 encoded string representation of the public key
+     */
+    public static String publicKeyToString(PublicKey publicKey) {
+        return Base64.getEncoder().encodeToString(publicKey.getEncoded());
+    }
+    
+    /**
+     * Reconstructs an RSA PublicKey from a Base64 encoded string.
+     * Expects X.509 encoded key data.
+     * 
+     * @param keyString The Base64 encoded public key string
+     * @return The reconstructed RSA PublicKey
+     * @throws Exception if key reconstruction fails
+     */
+    public static PublicKey stringToPublicKey(String keyString) throws Exception {
+        byte[] keyBytes = Base64.getDecoder().decode(keyString);
+        X509EncodedKeySpec spec = new X509EncodedKeySpec(keyBytes);
+        KeyFactory keyFactory = KeyFactory.getInstance(RSA_ALGORITHM);
+        return keyFactory.generatePublic(spec);
+    }
+    
+    /**
+     * Encrypts data using RSA-OAEP (Optimal Asymmetric Encryption Padding).
+     * OAEP uses SHA-256 hashing and MGF1 mask generation, providing:
+     * - Randomized padding (same plaintext → different ciphertext each time)
+     * - Provable security against chosen-ciphertext attacks
+     * - Protection against Bleichenbacher's attack (unlike PKCS#1 v1.5)
+     * 
+     * @param data The plaintext string to encrypt
+     * @param publicKey The RSA public key to encrypt with
+     * @return Base64 encoded RSA-OAEP encrypted string
+     * @throws Exception if encryption fails
+     */
+    public static String encryptWithRSA(String data, PublicKey publicKey) throws Exception {
+        Cipher cipher = Cipher.getInstance(RSA_TRANSFORMATION);
+        cipher.init(Cipher.ENCRYPT_MODE, publicKey);
+        byte[] encryptedBytes = cipher.doFinal(data.getBytes("UTF-8"));
+        return Base64.getEncoder().encodeToString(encryptedBytes);
+    }
+    
+    /**
+     * Decrypts RSA-OAEP encrypted data using the server's private key.
+     * Verifies the OAEP padding structure during decryption — any tampering
+     * with the ciphertext will cause a decryption failure.
+     * 
+     * @param encryptedData The Base64 encoded RSA-OAEP encrypted string
+     * @param privateKey The RSA private key to decrypt with
+     * @return The original plaintext string
+     * @throws Exception if decryption fails or padding verification fails
+     */
+    public static String decryptWithRSA(String encryptedData, PrivateKey privateKey) throws Exception {
+        Cipher cipher = Cipher.getInstance(RSA_TRANSFORMATION);
+        cipher.init(Cipher.DECRYPT_MODE, privateKey);
+        byte[] decryptedBytes = cipher.doFinal(Base64.getDecoder().decode(encryptedData));
+        return new String(decryptedBytes, "UTF-8");
     }
     
 }
