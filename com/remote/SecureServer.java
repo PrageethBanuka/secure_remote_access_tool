@@ -94,6 +94,10 @@ public class SecureServer {
         @Override
         public void run() {
             try {
+                // Set socket timeout to 5 minutes — prevents idle connections
+                // from holding server resources indefinitely
+                socket.setSoTimeout(1800000);
+                
                 BufferedReader in = new BufferedReader(
                     new InputStreamReader(socket.getInputStream()));
                 PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
@@ -211,7 +215,10 @@ public class SecureServer {
                     try {
                         // Decrypt the incoming command
                         String command = SecurityUtils.decrypt(encryptedCommand, key);
-                        System.out.println("Received command: " + command);
+                        // Log command receipt without exposing full command content
+                        // (prevents sensitive data like passwords in commands from leaking to logs)
+                        System.out.println("Received command from " + clientIP 
+                            + " (" + command.length() + " chars)");
                         
                         // Execute command using ProcessBuilder
                         ExecResult result = executeCommand(command, currentDirectory);

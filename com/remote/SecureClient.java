@@ -29,6 +29,9 @@ public class SecureClient {
             Socket socket = new Socket(address, port);
             System.out.println("Connected to server at " + address + ":" + port);
             
+            // Set socket timeout to 5 minutes to prevent indefinite hangs
+            socket.setSoTimeout(1800000);
+            
             try {
                 // Initialize input/output streams
                 BufferedReader in = new BufferedReader(
