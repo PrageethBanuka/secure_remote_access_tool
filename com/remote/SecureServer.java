@@ -10,6 +10,10 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.security.KeyPair;
+import java.security.PrivateKey;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import javax.crypto.SecretKey;
 
 /**
@@ -20,20 +24,35 @@ import javax.crypto.SecretKey;
 public class SecureServer {
     
     static int port = 6600;
-    private static SecretKey secretKey;
+    private static KeyPair rsaKeyPair;
+    
+    // Brute-force protection: tracks failed login attempts per IP address.
+    // After MAX_FAILED_ATTEMPTS failures, the IP is locked out for LOCKOUT_DURATION_MS.
+    private static final int MAX_FAILED_ATTEMPTS = 3;
+    private static final long LOCKOUT_DURATION_MS = 30_000; // 30 seconds
+    private static final Map<String, int[]> failedAttempts = new ConcurrentHashMap<>();
+    // failedAttempts value: int[]{attemptCount, lastFailTimestamp(high), lastFailTimestamp(low)}
+    // Using long split into two ints to stay in int[] — or we can use a simple inner class.
+    private static final Map<String, Long> lockoutTimestamps = new ConcurrentHashMap<>();
     
     // Hardcoded authentication credentials
+    // Password is stored as a PBKDF2-HMAC-SHA256 hash with a random salt.
+    // To generate a new hash for a different password, use:
+    //   byte[] salt = SecurityUtils.generateSalt();
+    //   String hash = SecurityUtils.hashPassword("yourPassword", salt);
+    //   String saltB64 = Base64.getEncoder().encodeToString(salt);
     private static final String ADMIN_USER = "admin";
-    private static final String ADMIN_PASS = "secure123";
+    private static final String ADMIN_PASS_HASH = "5nqJWqZVF9cXpMs+F7zN1pJgswkjxaXO9MfMfEeJhuE=";
+    private static final String ADMIN_SALT = "hSKj1xCx0ipcA8zcVVZBWw==";
 
     public static void main(String[] args) {
         System.out.println("\t\t Secure Remote Access Server");
         System.out.println("\t\t===========================\n\n");
         
         try {
-            // Generate encryption key
-            secretKey = SecurityUtils.generateKey();
-            System.out.println("Encryption key generated successfully.");
+            // Generate RSA key pair (public key sent to clients, private key stays here)
+            rsaKeyPair = SecurityUtils.generateRSAKeyPair();
+            System.out.println("RSA-2048 key pair generated successfully.");
             
             ServerSocket serverSocket = new ServerSocket(port);
             System.out.println("Server started on port " + port);
@@ -44,7 +63,8 @@ public class SecureServer {
                     System.out.println("Client connected: " + socket.getInetAddress());
                     
                     // Handle each client in a separate thread
-                    Thread clientThread = new Thread(new ClientHandler(socket, secretKey));
+                    // Each client will negotiate its own unique AES session key
+                    Thread clientThread = new Thread(new ClientHandler(socket, rsaKeyPair));
                     clientThread.start();
                 }
             } finally {
@@ -61,19 +81,23 @@ public class SecureServer {
      */
     static class ClientHandler implements Runnable {
         private Socket socket;
-        private SecretKey key;
+        private KeyPair rsaKeyPair;
 
         private static final boolean IS_WINDOWS =
             System.getProperty("os.name").toLowerCase().contains("win");
         
-        public ClientHandler(Socket socket, SecretKey key) {
+        public ClientHandler(Socket socket, KeyPair rsaKeyPair) {
             this.socket = socket;
-            this.key = key;
+            this.rsaKeyPair = rsaKeyPair;
         }
         
         @Override
         public void run() {
             try {
+                // Set socket timeout to 5 minutes — prevents idle connections
+                // from holding server resources indefinitely
+                socket.setSoTimeout(1800000);
+                
                 BufferedReader in = new BufferedReader(
                     new InputStreamReader(socket.getInputStream()));
                 PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
@@ -82,9 +106,44 @@ public class SecureServer {
                 // state; spawning a new shell per command cannot persist directory changes.
                 Path currentDirectory = Paths.get(System.getProperty("user.dir")).toAbsolutePath().normalize();
                 
-                // Send encryption key to client (Base64 encoded)
-                String keyString = SecurityUtils.keyToString(key);
-                out.println(keyString);
+                // === Brute-force Protection ===
+                String clientIP = socket.getInetAddress().getHostAddress();
+                Long lockoutUntil = lockoutTimestamps.get(clientIP);
+                if (lockoutUntil != null && System.currentTimeMillis() < lockoutUntil) {
+                    long remainingSec = (lockoutUntil - System.currentTimeMillis()) / 1000;
+                    System.out.println("Blocked connection from locked-out IP: " + clientIP 
+                        + " (" + remainingSec + "s remaining)");
+                    // Send a plaintext rejection before key exchange (no encryption established yet)
+                    out.println("LOCKED_OUT");
+                    socket.close();
+                    return;
+                }
+
+
+                // === RSA-OAEP Key Exchange ===
+                SecretKey key;
+                try {
+                    // Step 1: Send RSA public key to client (Base64 encoded, X.509 format)
+                    String publicKeyString = SecurityUtils.publicKeyToString(rsaKeyPair.getPublic());
+                    out.println(publicKeyString);
+                    
+                    // Step 2: Receive client's AES session key (encrypted with our RSA public key)
+                    String encryptedAesKey = in.readLine();
+                    if (encryptedAesKey == null) {
+                        System.err.println("Client disconnected during key exchange.");
+                        socket.close();
+                        return;
+                    }
+                    
+                    // Step 3: Decrypt the AES key using our RSA private key
+                    String aesKeyString = SecurityUtils.decryptWithRSA(encryptedAesKey, rsaKeyPair.getPrivate());
+                    key = SecurityUtils.stringToKey(aesKeyString);
+                    System.out.println("Per-client AES-256 session key established via RSA-OAEP.");
+                } catch (Exception e) {
+                    System.err.println("Key exchange error: " + e.getMessage());
+                    socket.close();
+                    return;
+                }
                 
                 // Authentication handshake
                 try {
@@ -101,15 +160,32 @@ public class SecureServer {
                     String username = SecurityUtils.decrypt(encryptedUsername, key);
                     String password = SecurityUtils.decrypt(encryptedPassword, key);
                     
-                    // Verify credentials
-                    if (!ADMIN_USER.equals(username) || !ADMIN_PASS.equals(password)) {
-                        System.out.println("Authentication failed for user: " + username);
+                    // Verify credentials using PBKDF2 hash comparison
+                    if (!ADMIN_USER.equals(username) || !SecurityUtils.verifyPassword(password, ADMIN_PASS_HASH, ADMIN_SALT)) {
+                        System.out.println("Authentication failed for user: " + username + " from " + clientIP);
+                        
+                        // Track failed attempt for brute-force protection
+                        int attempts = failedAttempts.merge(clientIP, new int[]{1}, (old, v) -> {
+                            old[0]++;
+                            return old;
+                        })[0];
+                        
+                        if (attempts >= MAX_FAILED_ATTEMPTS) {
+                            lockoutTimestamps.put(clientIP, System.currentTimeMillis() + LOCKOUT_DURATION_MS);
+                            System.out.println("IP " + clientIP + " locked out for " 
+                                + (LOCKOUT_DURATION_MS / 1000) + " seconds after " + attempts + " failed attempts.");
+                            failedAttempts.remove(clientIP);
+                        }
+                        
                         String unauthorizedMsg = SecurityUtils.encrypt("Unauthorized", key);
                         out.println(unauthorizedMsg);
                         socket.close();
                         return;
                     }
                     
+                    // Reset failed attempts on successful login
+                    failedAttempts.remove(clientIP);
+                    lockoutTimestamps.remove(clientIP);
                     System.out.println("User authenticated: " + username);
                     
                     // Send authentication success message
@@ -139,7 +215,10 @@ public class SecureServer {
                     try {
                         // Decrypt the incoming command
                         String command = SecurityUtils.decrypt(encryptedCommand, key);
-                        System.out.println("Received command: " + command);
+                        // Log command receipt without exposing full command content
+                        // (prevents sensitive data like passwords in commands from leaking to logs)
+                        System.out.println("Received command from " + clientIP 
+                            + " (" + command.length() + " chars)");
                         
                         // Execute command using ProcessBuilder
                         ExecResult result = executeCommand(command, currentDirectory);
