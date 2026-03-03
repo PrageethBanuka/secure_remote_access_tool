@@ -25,8 +25,14 @@ public class SecureServer {
     private static KeyPair rsaKeyPair;
     
     // Hardcoded authentication credentials
+    // Password is stored as a PBKDF2-HMAC-SHA256 hash with a random salt.
+    // To generate a new hash for a different password, use:
+    //   byte[] salt = SecurityUtils.generateSalt();
+    //   String hash = SecurityUtils.hashPassword("yourPassword", salt);
+    //   String saltB64 = Base64.getEncoder().encodeToString(salt);
     private static final String ADMIN_USER = "admin";
-    private static final String ADMIN_PASS = "secure123";
+    private static final String ADMIN_PASS_HASH = "5nqJWqZVF9cXpMs+F7zN1pJgswkjxaXO9MfMfEeJhuE=";
+    private static final String ADMIN_SALT = "hSKj1xCx0ipcA8zcVVZBWw==";
 
     public static void main(String[] args) {
         System.out.println("\t\t Secure Remote Access Server");
@@ -126,8 +132,8 @@ public class SecureServer {
                     String username = SecurityUtils.decrypt(encryptedUsername, key);
                     String password = SecurityUtils.decrypt(encryptedPassword, key);
                     
-                    // Verify credentials
-                    if (!ADMIN_USER.equals(username) || !ADMIN_PASS.equals(password)) {
+                    // Verify credentials using PBKDF2 hash comparison
+                    if (!ADMIN_USER.equals(username) || !SecurityUtils.verifyPassword(password, ADMIN_PASS_HASH, ADMIN_SALT)) {
                         System.out.println("Authentication failed for user: " + username);
                         String unauthorizedMsg = SecurityUtils.encrypt("Unauthorized", key);
                         out.println(unauthorizedMsg);

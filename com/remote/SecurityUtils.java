@@ -3,7 +3,9 @@ package com.remote;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
+import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.PBEKeySpec;
 import javax.crypto.spec.SecretKeySpec;
 import java.security.KeyFactory;
 import java.security.KeyPair;
@@ -12,6 +14,7 @@ import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.SecureRandom;
+import java.security.spec.InvalidKeySpecException;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.Base64;
 
@@ -31,6 +34,12 @@ public class SecurityUtils {
     private static final String RSA_ALGORITHM = "RSA";
     private static final String RSA_TRANSFORMATION = "RSA/ECB/OAEPWithSHA-256AndMGF1Padding";
     private static final int RSA_KEY_SIZE = 2048;
+    
+    // PBKDF2 parameters for password hashing
+    private static final String PBKDF2_ALGORITHM = "PBKDF2WithHmacSHA256";
+    private static final int PBKDF2_ITERATIONS = 65536;  // 2^16 iterations (slow enough to resist brute-force)
+    private static final int PBKDF2_KEY_LENGTH = 256;    // 256-bit derived key
+    private static final int SALT_LENGTH = 16;           // 128-bit random salt
     
     /**
      * Generates a new AES SecretKey for encryption and decryption.
@@ -200,6 +209,76 @@ public class SecurityUtils {
         cipher.init(Cipher.DECRYPT_MODE, privateKey);
         byte[] decryptedBytes = cipher.doFinal(Base64.getDecoder().decode(encryptedData));
         return new String(decryptedBytes, "UTF-8");
+    }
+    
+    // ======================== PBKDF2 Password Hashing ========================
+    
+    /**
+     * Generates a cryptographically secure random salt for password hashing.
+     * Each user should have a unique salt to prevent rainbow table attacks.
+     * 
+     * @return A 16-byte (128-bit) random salt
+     */
+    public static byte[] generateSalt() {
+        byte[] salt = new byte[SALT_LENGTH];
+        new SecureRandom().nextBytes(salt);
+        return salt;
+    }
+    
+    /**
+     * Hashes a password using PBKDF2-HMAC-SHA256 with the given salt.
+     * PBKDF2 applies the HMAC function iteratively (65536 times), making
+     * brute-force attacks computationally expensive.
+     * 
+     * Why PBKDF2 over plain SHA-256:
+     * - SHA-256 is fast → attacker can try billions of passwords/sec
+     * - PBKDF2 is intentionally slow → drastically limits brute-force speed
+     * - Salt prevents pre-computed rainbow table attacks
+     * 
+     * @param password The plaintext password to hash
+     * @param salt The salt bytes (should be unique per user)
+     * @return Base64 encoded hash string
+     * @throws NoSuchAlgorithmException if PBKDF2 algorithm is not available
+     * @throws InvalidKeySpecException if the key spec is invalid
+     */
+    public static String hashPassword(String password, byte[] salt) 
+            throws NoSuchAlgorithmException, InvalidKeySpecException {
+        PBEKeySpec spec = new PBEKeySpec(password.toCharArray(), salt, PBKDF2_ITERATIONS, PBKDF2_KEY_LENGTH);
+        SecretKeyFactory factory = SecretKeyFactory.getInstance(PBKDF2_ALGORITHM);
+        byte[] hash = factory.generateSecret(spec).getEncoded();
+        spec.clearPassword(); // Clear sensitive data from memory
+        return Base64.getEncoder().encodeToString(hash);
+    }
+    
+    /**
+     * Verifies a plaintext password against a stored PBKDF2 hash and salt.
+     * Uses constant-time comparison to prevent timing attacks.
+     * 
+     * @param password The plaintext password to verify
+     * @param storedHash The Base64 encoded stored hash to compare against
+     * @param storedSalt The Base64 encoded salt used when the hash was created
+     * @return true if the password matches, false otherwise
+     */
+    public static boolean verifyPassword(String password, String storedHash, String storedSalt) {
+        try {
+            byte[] salt = Base64.getDecoder().decode(storedSalt);
+            String computedHash = hashPassword(password, salt);
+            
+            // Constant-time comparison to prevent timing attacks:
+            // An attacker cannot determine how many bytes matched based on response time.
+            byte[] a = Base64.getDecoder().decode(computedHash);
+            byte[] b = Base64.getDecoder().decode(storedHash);
+            
+            if (a.length != b.length) return false;
+            
+            int result = 0;
+            for (int i = 0; i < a.length; i++) {
+                result |= a[i] ^ b[i];
+            }
+            return result == 0;
+        } catch (Exception e) {
+            return false;
+        }
     }
     
 }
